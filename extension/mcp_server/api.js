@@ -20,10 +20,24 @@
  * - It bundles Mozilla's httpd.sys.mjs (MPL-2.0) copied from thunderbird-mcp.
  */
 
+const resProto = Cc[
+  "@mozilla.org/network/protocol;1?name=resource"
+].getService(Ci.nsISubstitutingProtocolHandler);
+
 const MCP_PORT = 8766;
 
 var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
+    // Make the bundled httpd.sys.mjs available via resource://thunderbird-tbsync-mcp/...
+    const extensionRoot = context.extension.rootURI;
+    const resourceName = "thunderbird-tbsync-mcp";
+
+    resProto.setSubstitutionWithFlags(
+      resourceName,
+      extensionRoot,
+      resProto.ALLOW_CONTENT_ACCESS
+    );
+
     return {
       tbsyncMcpServer: {
         start: async function () {
