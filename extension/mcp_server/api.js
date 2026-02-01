@@ -237,11 +237,16 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
 
               const timeoutMs = 15000;
-              const timeoutPromise = new Promise((resolve) =>
-                Services.tm.dispatchToMainThread(() => {
-                  setTimeout(() => resolve({ timeout: true }), timeoutMs);
-                })
-              );
+              const timeoutPromise = new Promise((resolve) => {
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.init(
+                  {
+                    notify: () => resolve({ timeout: true }),
+                  },
+                  timeoutMs,
+                  Ci.nsITimer.TYPE_ONE_SHOT
+                );
+              });
 
               const result = await Promise.race([opPromise, timeoutPromise]);
               if (result.error) return result;
@@ -346,12 +351,16 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               // Some calendar providers can take a long time to respond. Avoid hanging the MCP call.
               const timeoutMs = 15000;
-              const timeoutPromise = new Promise((resolve) =>
-                Services.tm.dispatchToMainThread(() => {
-                  // Use a main-thread dispatch to ensure the timer is scheduled.
-                  setTimeout(() => resolve({ timeout: true }), timeoutMs);
-                })
-              );
+              const timeoutPromise = new Promise((resolve) => {
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.init(
+                  {
+                    notify: () => resolve({ timeout: true }),
+                  },
+                  timeoutMs,
+                  Ci.nsITimer.TYPE_ONE_SHOT
+                );
+              });
 
               const result = await Promise.race([opPromise, timeoutPromise]);
 
