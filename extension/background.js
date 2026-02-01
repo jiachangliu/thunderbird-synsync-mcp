@@ -15,3 +15,7 @@ async function init() {
 
 browser.runtime.onInstalled.addListener(init);
 browser.runtime.onStartup.addListener(init);
+
+// In some Thunderbird setups, onStartup may not fire for sideloaded dev XPIs
+// as expected. Call init() once at module load as a fallback.
+init();
