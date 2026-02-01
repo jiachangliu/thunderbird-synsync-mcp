@@ -1,6 +1,11 @@
 /* global browser */
 
+let _initStarted = false;
+
 async function init() {
+  if (_initStarted) return;
+  _initStarted = true;
+
   try {
     const result = await browser.tbsyncMcpServer.start();
     if (result && result.success) {

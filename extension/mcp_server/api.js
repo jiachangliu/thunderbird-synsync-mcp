@@ -25,6 +25,9 @@ const resProto = Cc[
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
 const MCP_PORT = 8766;
+let _serverStarted = false;
+let _serverStarting = false;
+let _serverPort = null;
 
 var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
@@ -42,6 +45,13 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
       tbsyncMcpServer: {
         start: async function () {
           try {
+            if (_serverStarted) {
+              return { success: true, port: _serverPort || MCP_PORT, alreadyStarted: true };
+            }
+            if (_serverStarting) {
+              return { success: true, port: _serverPort || MCP_PORT, starting: true };
+            }
+            _serverStarting = true;
             const { HttpServer } = ChromeUtils.importESModule(
               "resource://thunderbird-tbsync-mcp/httpd.sys.mjs?" + Date.now()
             );
@@ -73,6 +83,124 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
             function sanitizeForJson(text) {
               if (!text) return text;
               return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+            }
+
+            // Keep timeout timers strongly referenced; otherwise they can be GC'd before firing.
+            const _activeTimers = new Set();
+            function timeoutAfter(timeoutMs) {
+              return new Promise((resolve) => {
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                _activeTimers.add(timer);
+                timer.init(
+                  {
+                    notify: () => {
+                      try {
+                        _activeTimers.delete(timer);
+                      } catch {}
+                      resolve({ timeout: true });
+                    },
+                  },
+                  timeoutMs,
+                  Ci.nsITimer.TYPE_ONE_SHOT
+                );
+              });
+            }
+
+            // Non-blocking calendar query jobs (avoids hanging MCP calls if providers never complete).
+            const _calendarJobs = new Map();
+            let _calendarJobSeq = 0;
+
+            function newCalendarJobId() {
+              _calendarJobSeq += 1;
+              return `caljob-${Date.now()}-${_calendarJobSeq}`;
+            }
+
+            function startGetItemsJob(target, filter, startDt, endDt, meta) {
+              const jobId = newCalendarJobId();
+              const job = {
+                jobId,
+                status: "pending",
+                createdAtMs: Date.now(),
+                meta: meta || {},
+                events: [],
+                error: null,
+              };
+              _calendarJobs.set(jobId, job);
+
+              try {
+                target.getItems(filter, 0, startDt, endDt, {
+                  onOperationComplete: function () {
+                    job.status = "done";
+                  },
+                  onGetResult: function (_cal, _status, _opType, _id, _detail, count, items) {
+                    for (let i = 0; i < count; i++) {
+                      const it = items[i];
+                      job.events.push({
+                        id: it.id || null,
+                        title: it.title || null,
+                        allDay: it.startDate ? !!it.startDate.isDate : null,
+                        start: it.startDate ? it.startDate.icalString : null,
+                        end: it.endDate ? it.endDate.icalString : null,
+                      });
+                    }
+                  },
+                });
+              } catch (e) {
+                job.status = "error";
+                job.error = e.toString();
+              }
+
+              return job;
+            }
+
+            function startAddItemJob(target, item, meta) {
+              const jobId = newCalendarJobId();
+              const job = {
+                jobId,
+                status: "pending",
+                createdAtMs: Date.now(),
+                meta: meta || {},
+                events: [],
+                error: null,
+                itemId: null,
+              };
+              _calendarJobs.set(jobId, job);
+
+              try {
+                target.addItem(item, {
+                  onOperationComplete: function (_cal, status, _opType, id, _detail) {
+                    job.itemId = id || null;
+                    // status is an nsresult; if non-zero, treat as error.
+                    if (status && status !== 0) {
+                      job.status = "error";
+                      job.error = `addItem failed with status=${status}`;
+                    } else {
+                      job.status = "done";
+                    }
+                  },
+                  onGetResult: function () {},
+                });
+              } catch (e) {
+                job.status = "error";
+                job.error = e.toString();
+              }
+
+              return job;
+            }
+
+            function getCalendarJob(jobId) {
+              const job = _calendarJobs.get(String(jobId));
+              if (!job) return { error: `Unknown jobId: ${jobId}` };
+              return {
+                success: true,
+                jobId: job.jobId,
+                status: job.status,
+                createdAtMs: job.createdAtMs,
+                meta: job.meta,
+                count: job.events.length,
+                events: job.events,
+                error: job.error,
+              };
             }
 
             async function assertTbSyncInstalled() {
@@ -218,73 +346,33 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 FILTER.ITEM_FILTER_COMPLETED_YES |
                 FILTER.ITEM_FILTER_COMPLETED_NO;
 
-              const opPromise = new Promise((resolve) => {
-                const out = [];
-                try {
-                  target.getItems(filter, 0, start, end, {
-                    onOperationComplete: function (_cal, _status, _opType, _id, _detail) {
-                      resolve({ items: out });
-                    },
-                    onGetResult: function (_cal, _status, _opType, _id, _detail, count, items) {
-                      for (let i = 0; i < count; i++) {
-                        out.push(items[i]);
-                      }
-                    },
-                  });
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
+              const job = startGetItemsJob(target, filter, start, end, {
+                kind: "date",
+                date,
+                calendar: { id: target.id, name: target.name },
               });
-
-              const timeoutMs = 15000;
-              const timeoutPromise = new Promise((resolve) => {
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                timer.init(
-                  {
-                    notify: () => resolve({ timeout: true }),
-                  },
-                  timeoutMs,
-                  Ci.nsITimer.TYPE_ONE_SHOT
-                );
-              });
-
-              const result = await Promise.race([opPromise, timeoutPromise]);
-              if (result.error) return result;
-
-              const items = result.items || [];
 
               return {
                 success: true,
                 calendar: { id: target.id, name: target.name },
                 date,
-                count: items.length,
-                pending: !!result.timeout,
-                note: result.timeout ? `getItems did not return within ${timeoutMs}ms; results may be incomplete.` : undefined,
-                events: items.map((it) => ({
-                  id: it.id || null,
-                  title: it.title || null,
-                  start: it.startDate ? it.startDate.icalString : null,
-                  end: it.endDate ? it.endDate.icalString : null,
-                })),
+                pending: job.status === "pending",
+                jobId: job.jobId,
+                count: job.events.length,
+                events: job.events,
+                note: "Non-blocking query started. Poll with getCalendarJob(jobId) to retrieve results (and partial results while pending).",
               };
             }
 
-            async function createCalendarEvent(args) {
+            async function listCalendarEvents(args) {
               if (!cal) {
                 return { error: "Calendar not available" };
               }
 
-              const {
-                calendarName,
-                calendarId,
-                title,
-                description,
-                allDay,
-                // For all-day events: use YYYY-MM-DD in local timezone (floating).
-                date,
-              } = args || {};
-
-              if (!title) return { error: "Missing required field: title" };
+              const { calendarName, calendarId, start, end } = args || {};
+              if (!start || !end) {
+                return { error: "Missing required fields: start, end (YYYY-MM-DDTHH:MM)" };
+              }
 
               const calendars = cal.manager.getCalendars();
               let target = null;
@@ -293,93 +381,200 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               } else if (calendarName) {
                 target = calendars.find((c) => c.name === calendarName) || null;
               }
-
               if (!target) {
                 return { error: `Calendar not found (name=${calendarName || ""}, id=${calendarId || ""})` };
+              }
+
+              const range = makeTimedRange(start, end);
+              if (!range) {
+                return { error: `Invalid datetime format (expected YYYY-MM-DDTHH:MM): start=${start} end=${end}` };
+              }
+              if (range.error) return { error: range.error };
+
+              const FILTER = Ci.calICalendar;
+              const filter =
+                FILTER.ITEM_FILTER_TYPE_EVENT |
+                FILTER.ITEM_FILTER_CLASS_OCCURRENCES |
+                FILTER.ITEM_FILTER_COMPLETED_YES |
+                FILTER.ITEM_FILTER_COMPLETED_NO;
+
+              const job = startGetItemsJob(target, filter, range.start, range.end, {
+                kind: "range",
+                start,
+                end,
+                calendar: { id: target.id, name: target.name },
+              });
+
+              return {
+                success: true,
+                calendar: { id: target.id, name: target.name },
+                start,
+                end,
+                pending: job.status === "pending",
+                jobId: job.jobId,
+                count: job.events.length,
+                events: job.events,
+                note: "Non-blocking query started. Poll with getCalendarJob(jobId) to retrieve results (and partial results while pending).",
+              };
+            }
+
+            function parseDateYMD(dateStr) {
+              const [y, m, d] = String(dateStr).split("-").map((x) => parseInt(x, 10));
+              if (!y || !m || !d) return null;
+              return { y, m, d };
+            }
+
+            function parseDateTimeLocal(dtStr) {
+              // Accept "YYYY-MM-DDTHH:MM" (preferred) or "YYYY-MM-DD HH:MM".
+              const s = String(dtStr || "").trim();
+              const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})$/);
+              if (!m) return null;
+              return {
+                y: parseInt(m[1], 10),
+                mo: parseInt(m[2], 10),
+                d: parseInt(m[3], 10),
+                hh: parseInt(m[4], 10),
+                mm: parseInt(m[5], 10),
+              };
+            }
+
+            function makeAllDayRange(dateStr) {
+              const ymd = parseDateYMD(dateStr);
+              if (!ymd) return null;
+
+              const start = cal.createDateTime();
+              start.year = ymd.y;
+              start.month = ymd.m - 1;
+              start.day = ymd.d;
+              start.isDate = true;
+              start.timezone = cal.dtz.floating;
+
+              const end = start.clone();
+              end.day = end.day + 1;
+              end.isDate = true;
+              end.timezone = cal.dtz.floating;
+
+              return { start, end };
+            }
+
+            function makeTimedRange(startStr, endStr) {
+              const s = parseDateTimeLocal(startStr);
+              const e = parseDateTimeLocal(endStr);
+              if (!s || !e) return null;
+
+              const start = cal.createDateTime();
+              start.year = s.y;
+              start.month = s.mo - 1;
+              start.day = s.d;
+              start.hour = s.hh;
+              start.minute = s.mm;
+              start.second = 0;
+              start.isDate = false;
+              // Use default timezone so events display correctly across clients.
+              start.timezone = cal.dtz.defaultTimezone;
+
+              const end = cal.createDateTime();
+              end.year = e.y;
+              end.month = e.mo - 1;
+              end.day = e.d;
+              end.hour = e.hh;
+              end.minute = e.mm;
+              end.second = 0;
+              end.isDate = false;
+              end.timezone = cal.dtz.defaultTimezone;
+
+              if (end.compare(start) <= 0) return { error: "end must be after start" };
+
+              return { start, end };
+            }
+
+            function resolveCalendar(args) {
+              const { calendarName, calendarId } = args || {};
+              const calendars = cal.manager.getCalendars();
+              let target = null;
+              if (calendarId) {
+                target = calendars.find((c) => c.id === calendarId) || null;
+              } else if (calendarName) {
+                target = calendars.find((c) => c.name === calendarName) || null;
+              }
+              return target;
+            }
+
+            async function createCalendarEvent(args) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+
+              const {
+                title,
+                description,
+                allDay,
+                // All-day:
+                date,
+                // Timed:
+                start,
+                end,
+              } = args || {};
+
+              if (!title) return { error: "Missing required field: title" };
+              if (typeof allDay !== "boolean") return { error: "Missing required field: allDay (boolean)" };
+
+              const target = resolveCalendar(args);
+              if (!target) {
+                return { error: `Calendar not found (name=${(args || {}).calendarName || ""}, id=${(args || {}).calendarId || ""})` };
               }
               if (target.readOnly) {
                 return { error: `Calendar is read-only: ${target.name}` };
               }
 
-              if (!allDay) {
-                return { error: "Only allDay=true is implemented in v0.1.0" };
-              }
-              if (!date) {
-                return { error: "Missing required field for all-day events: date (YYYY-MM-DD)" };
-              }
-
-              // Create an all-day event.
               const ev = Cc["@mozilla.org/calendar/event;1"].createInstance(Ci.calIEvent);
               ev.title = title;
               if (description) {
                 ev.setProperty("DESCRIPTION", description);
               }
 
-              const [y, m, d] = String(date).split("-").map((x) => parseInt(x, 10));
-              if (!y || !m || !d) {
-                return { error: `Invalid date format (expected YYYY-MM-DD): ${date}` };
+              let range = null;
+              if (allDay) {
+                if (!date) return { error: "Missing required field for all-day events: date (YYYY-MM-DD)" };
+                range = makeAllDayRange(date);
+                if (!range) return { error: `Invalid date format (expected YYYY-MM-DD): ${date}` };
+              } else {
+                if (!start || !end) return { error: "Missing required fields for timed events: start, end (YYYY-MM-DDTHH:MM)" };
+                range = makeTimedRange(start, end);
+                if (!range) return { error: `Invalid datetime format (expected YYYY-MM-DDTHH:MM): start=${start} end=${end}` };
+                if (range.error) return { error: range.error };
               }
 
-              const start = cal.createDateTime();
-              start.year = y;
-              start.month = m - 1; // CalDateTime uses 0-based months
-              start.day = d;
-              start.isDate = true;
-              start.timezone = cal.dtz.floating;
+              ev.startDate = range.start;
+              ev.endDate = range.end;
 
-              const end = start.clone();
-              // All-day events are typically [start, next day)
-              end.day = end.day + 1;
-              end.isDate = true;
-              end.timezone = cal.dtz.floating;
-
-              ev.startDate = start;
-              ev.endDate = end;
-
-              const opPromise = new Promise((resolve) => {
-                try {
-                  target.addItem(ev, {
-                    onOperationComplete: function (_cal, status, opType, id, detail) {
-                      resolve({ status, opType, id, detail });
-                    },
-                    onGetResult: function () {},
-                  });
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
+              const job = startAddItemJob(target, ev, {
+                kind: "addItem",
+                calendar: { id: target.id, name: target.name },
+                title,
+                allDay,
+                date: allDay ? date : undefined,
+                start: !allDay ? range.start.icalString : undefined,
+                end: !allDay ? range.end.icalString : undefined,
               });
-
-              // Some calendar providers can take a long time to respond. Avoid hanging the MCP call.
-              const timeoutMs = 15000;
-              const timeoutPromise = new Promise((resolve) => {
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                timer.init(
-                  {
-                    notify: () => resolve({ timeout: true }),
-                  },
-                  timeoutMs,
-                  Ci.nsITimer.TYPE_ONE_SHOT
-                );
-              });
-
-              const result = await Promise.race([opPromise, timeoutPromise]);
-
-              if (result.error) return result;
 
               return {
                 success: true,
                 calendar: { id: target.id, name: target.name },
-                itemId: result.id || null,
                 title,
-                allDay: true,
-                date,
-                pending: !!result.timeout,
-                note: result.timeout ? `addItem did not return within ${timeoutMs}ms; event may still be created and will appear after provider finishes.` : undefined,
+                allDay,
+                date: allDay ? date : undefined,
+                start: !allDay ? range.start.icalString : undefined,
+                end: !allDay ? range.end.icalString : undefined,
+                pending: job.status === "pending",
+                jobId: job.jobId,
+                itemId: job.itemId || null,
+                note: "Non-blocking create started. Poll with getCalendarJob(jobId) to confirm completion and retrieve itemId.",
               };
             }
 
             async function sleepMs(ms) {
-              return new Promise((resolve) => setTimeout(resolve, ms));
+              await timeoutAfter(ms);
             }
 
             async function syncAndCreateCalendarEvent(args) {
@@ -441,7 +636,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               {
                 name: "createCalendarEvent",
                 title: "Create Calendar Event",
-                description: "Create an event in a calendar (v0.1.0: all-day only)",
+                description: "Create an event in a calendar (all-day or timed)",
                 inputSchema: {
                   type: "object",
                   properties: {
@@ -450,9 +645,11 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     title: { type: "string" },
                     description: { type: "string" },
                     allDay: { type: "boolean" },
-                    date: { type: "string", description: "YYYY-MM-DD (for all-day events)" },
+                    date: { type: "string", description: "YYYY-MM-DD (required when allDay=true)" },
+                    start: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
+                    end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                   },
-                  required: ["title", "allDay", "date"],
+                  required: ["title", "allDay"],
                 },
               },
               {
@@ -470,6 +667,33 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 },
               },
               {
+                name: "listCalendarEvents",
+                title: "List Calendar Events",
+                description: "Start a non-blocking query to list events in a calendar over a date/time range (poll via getCalendarJob)",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    calendarName: { type: "string" },
+                    calendarId: { type: "string" },
+                    start: { type: "string", description: "YYYY-MM-DDTHH:MM" },
+                    end: { type: "string", description: "YYYY-MM-DDTHH:MM" }
+                  },
+                  required: ["start", "end"],
+                },
+              },
+              {
+                name: "getCalendarJob",
+                title: "Get Calendar Job",
+                description: "Poll a non-blocking calendar query job by jobId",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    jobId: { type: "string" }
+                  },
+                  required: ["jobId"],
+                },
+              },
+              {
                 name: "syncAndCreateCalendarEvent",
                 title: "Sync + Create Calendar Event",
                 description: "Pre-sync, create event locally, then post-sync (safest workflow)",
@@ -482,9 +706,11 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     title: { type: "string" },
                     description: { type: "string" },
                     allDay: { type: "boolean" },
-                    date: { type: "string" },
+                    date: { type: "string", description: "YYYY-MM-DD (required when allDay=true)" },
+                    start: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
+                    end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                   },
-                  required: ["tbsyncUser", "title", "allDay", "date"],
+                  required: ["tbsyncUser", "title", "allDay"],
                 },
               },
             ];
@@ -503,6 +729,10 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await createCalendarEvent(args);
                 case "listEventsOnDate":
                   return await listEventsOnDate(args);
+                case "listCalendarEvents":
+                  return await listCalendarEvents(args);
+                case "getCalendarJob":
+                  return getCalendarJob(args.jobId);
                 case "syncAndCreateCalendarEvent":
                   return await syncAndCreateCalendarEvent(args);
                 default:
@@ -581,9 +811,13 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
             });
 
             server.start(MCP_PORT);
+            _serverStarted = true;
+            _serverStarting = false;
+            _serverPort = MCP_PORT;
 
             return { success: true, port: MCP_PORT };
           } catch (e) {
+            _serverStarting = false;
             return { success: false, error: e.toString() };
           }
         },
