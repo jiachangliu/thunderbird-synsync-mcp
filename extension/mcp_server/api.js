@@ -175,6 +175,77 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            async function listEventsOnDate(args) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+
+              const { calendarName, calendarId, date } = args || {};
+              if (!date) return { error: "Missing required field: date (YYYY-MM-DD)" };
+
+              const calendars = cal.manager.getCalendars();
+              let target = null;
+              if (calendarId) {
+                target = calendars.find((c) => c.id === calendarId) || null;
+              } else if (calendarName) {
+                target = calendars.find((c) => c.name === calendarName) || null;
+              }
+              if (!target) {
+                return { error: `Calendar not found (name=${calendarName || ""}, id=${calendarId || ""})` };
+              }
+
+              const [y, m, d] = String(date).split("-").map((x) => parseInt(x, 10));
+              if (!y || !m || !d) {
+                return { error: `Invalid date format (expected YYYY-MM-DD): ${date}` };
+              }
+
+              const start = cal.createDateTime();
+              start.year = y;
+              start.month = m - 1;
+              start.day = d;
+              start.isDate = true;
+              start.timezone = cal.dtz.floating;
+
+              const end = start.clone();
+              end.day = end.day + 1;
+              end.isDate = true;
+              end.timezone = cal.dtz.floating;
+
+              const FILTER = Ci.calICalendar;
+              const filter =
+                FILTER.ITEM_FILTER_TYPE_EVENT |
+                FILTER.ITEM_FILTER_CLASS_OCCURRENCES |
+                FILTER.ITEM_FILTER_COMPLETED_YES |
+                FILTER.ITEM_FILTER_COMPLETED_NO;
+
+              const items = await new Promise((resolve) => {
+                const out = [];
+                target.getItems(filter, 0, start, end, {
+                  onOperationComplete: function (_cal, _status, _opType, _id, _detail) {
+                    resolve(out);
+                  },
+                  onGetResult: function (_cal, _status, _opType, _id, _detail, count, items) {
+                    for (let i = 0; i < count; i++) {
+                      out.push(items[i]);
+                    }
+                  },
+                });
+              });
+
+              return {
+                success: true,
+                calendar: { id: target.id, name: target.name },
+                date,
+                count: items.length,
+                events: items.map((it) => ({
+                  id: it.id || null,
+                  title: it.title || null,
+                  start: it.startDate ? it.startDate.icalString : null,
+                  end: it.endDate ? it.endDate.icalString : null,
+                })),
+              };
+            }
+
             async function createCalendarEvent(args) {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -358,6 +429,20 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 },
               },
               {
+                name: "listEventsOnDate",
+                title: "List Events on Date",
+                description: "List events on a specific date in a calendar (for verification/debug)",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    calendarName: { type: "string" },
+                    calendarId: { type: "string" },
+                    date: { type: "string", description: "YYYY-MM-DD" }
+                  },
+                  required: ["date"],
+                },
+              },
+              {
                 name: "syncAndCreateCalendarEvent",
                 title: "Sync + Create Calendar Event",
                 description: "Pre-sync, create event locally, then post-sync (safest workflow)",
@@ -389,6 +474,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listCalendars();
                 case "createCalendarEvent":
                   return await createCalendarEvent(args);
+                case "listEventsOnDate":
+                  return await listEventsOnDate(args);
                 case "syncAndCreateCalendarEvent":
                   return await syncAndCreateCalendarEvent(args);
                 default:
