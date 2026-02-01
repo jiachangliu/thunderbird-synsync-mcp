@@ -138,6 +138,151 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
+            function containsAll(haystack, needles) {
+              const h = String(haystack || "").toLowerCase();
+              for (const n of (needles || [])) {
+                const nn = String(n || "").toLowerCase().trim();
+                if (!nn) continue;
+                if (!h.includes(nn)) return false;
+              }
+              return true;
+            }
+
+            async function syncAndDeleteEventsByTitle(args) {
+              // Delete events within a time range whose title contains ALL given substrings.
+              // Uses streaming getItems results: deletes as results arrive (does not wait for completion).
+              const { tbsyncUser, calendarName, calendarId, start, end, titleMustContainAll } = args || {};
+              if (!tbsyncUser) return { error: "Missing required field: tbsyncUser" };
+              if (!start || !end) return { error: "Missing required fields: start, end (YYYY-MM-DDTHH:MM)" };
+
+              const target = resolveCalendar({ calendarName, calendarId });
+              if (!target) return { error: `Calendar not found (name=${calendarName || ""}, id=${calendarId || ""})` };
+              if (target.readOnly) return { error: `Calendar is read-only: ${target.name}` };
+
+              const range = makeTimedRange(start, end);
+              if (!range) return { error: `Invalid datetime format (expected YYYY-MM-DDTHH:MM): start=${start} end=${end}` };
+              if (range.error) return { error: range.error };
+
+              const wfJobId = newWorkflowJobId();
+              const job = {
+                jobId: wfJobId,
+                status: "running",
+                createdAtMs: Date.now(),
+                updatedAtMs: Date.now(),
+                step: "start",
+                meta: { tbsyncUser, calendar: { id: target.id, name: target.name }, start, end, titleMustContainAll },
+                result: { matched: 0, deletedTriggered: 0 },
+                error: null,
+              };
+              _workflowJobs.set(wfJobId, job);
+
+              (async () => {
+                try {
+                  job.step = "preSync";
+                  job.updatedAtMs = Date.now();
+                  // Do not call TbSync here; it can block. We'll sync after deletions.
+
+                  job.step = "scanAndDelete";
+                  job.updatedAtMs = Date.now();
+                  maybeRefreshCalendar(target);
+
+                  const FILTER = Ci.calICalendar;
+                  const filter =
+                    FILTER.ITEM_FILTER_TYPE_EVENT |
+                    FILTER.ITEM_FILTER_CLASS_OCCURRENCES |
+                    FILTER.ITEM_FILTER_COMPLETED_YES |
+                    FILTER.ITEM_FILTER_COMPLETED_NO;
+
+                  const listener = {
+                    onOperationComplete: function () {
+                      // Cancel fallback timer if any.
+                      try {
+                        if (job._timer) {
+                          job._timer.cancel();
+                        }
+                      } catch {}
+
+                      try {
+                        job.step = "postSync";
+                        job.updatedAtMs = Date.now();
+                        try { tbsyncSyncAccountByUser(tbsyncUser); } catch {}
+                        try { tbsyncSyncAccountByUser(tbsyncUser); } catch {}
+                        job.status = "done";
+                        job.step = "done";
+                        job.updatedAtMs = Date.now();
+                      } catch (e) {
+                        job.status = "error";
+                        job.step = "error";
+                        job.error = e.toString();
+                        job.updatedAtMs = Date.now();
+                      }
+                    },
+                    onGetResult: function (_cal, _status, _opType, _id, _detail, count, items) {
+                      for (let i = 0; i < count; i++) {
+                        const it = items[i];
+                        const title = it && it.title ? it.title : "";
+                        if (!containsAll(title, titleMustContainAll)) continue;
+                        job.result.matched += 1;
+                        try {
+                          startDeleteItemJob(target, it, { reason: "bulkDelete", title });
+                          job.result.deletedTriggered += 1;
+                        } catch (e) {
+                          // ignore per-item errors
+                        }
+                      }
+                      job.updatedAtMs = Date.now();
+                    },
+                  };
+
+                  // Keep listener alive.
+                  job._listener = listener;
+                  target.getItems(filter, 0, range.start, range.end, listener);
+
+                  // Fallback: finish after a delay even if provider never calls onOperationComplete.
+                  // Use nsITimer (no await) and keep it referenced on the job.
+                  try {
+                    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                    job._timer = timer;
+                    timer.init(
+                      {
+                        notify: () => {
+                          try {
+                            if (job.status !== "running") return;
+                            job.step = "postSync";
+                            job.updatedAtMs = Date.now();
+                            try { tbsyncSyncAccountByUser(tbsyncUser); } catch {}
+                            try { tbsyncSyncAccountByUser(tbsyncUser); } catch {}
+                            job.status = "done";
+                            job.step = "done";
+                            job.updatedAtMs = Date.now();
+                          } catch (e) {
+                            job.status = "error";
+                            job.step = "error";
+                            job.updatedAtMs = Date.now();
+                            job.error = e.toString();
+                          }
+                        },
+                      },
+                      20000,
+                      Ci.nsITimer.TYPE_ONE_SHOT
+                    );
+                  } catch {}
+                } catch (e) {
+                  job.status = "error";
+                  job.step = "error";
+                  job.updatedAtMs = Date.now();
+                  job.error = e.toString();
+                }
+              })();
+
+              return {
+                success: true,
+                pending: true,
+                workflowJobId: wfJobId,
+                note: "Delete workflow started. Poll with getWorkflowJob(workflowJobId).",
+              };
+            }
+
             function newCalendarJobId() {
               _calendarJobSeq += 1;
               return `caljob-${Date.now()}-${_calendarJobSeq}`;
@@ -214,6 +359,41 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Keep listener alive until completion.
                 job._listener = listener;
                 target.addItem(item, listener);
+              } catch (e) {
+                job.status = "error";
+                job.error = e.toString();
+              }
+
+              return job;
+            }
+
+            function startDeleteItemJob(target, item, meta) {
+              const jobId = newCalendarJobId();
+              const job = {
+                jobId,
+                status: "pending",
+                createdAtMs: Date.now(),
+                meta: meta || {},
+                events: [],
+                error: null,
+                deletedId: item && item.id ? item.id : null,
+              };
+              _calendarJobs.set(jobId, job);
+
+              try {
+                const listener = {
+                  onOperationComplete: function (_cal, status) {
+                    if (status && status !== 0) {
+                      job.status = "error";
+                      job.error = `deleteItem failed with status=${status}`;
+                    } else {
+                      job.status = "done";
+                    }
+                  },
+                  onGetResult: function () {},
+                };
+                job._listener = listener;
+                target.deleteItem(item, listener);
               } catch (e) {
                 job.status = "error";
                 job.error = e.toString();
@@ -863,7 +1043,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               {
                 name: "syncAndCreateCalendarEvent",
                 title: "Sync + Create Calendar Event",
-                description: "Pre-sync, create event locally, then post-sync (safest workflow)",
+                description: "Start a non-blocking workflow: pre-sync, create event locally, post-sync",
                 inputSchema: {
                   type: "object",
                   properties: {
@@ -879,6 +1059,23 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["tbsyncUser", "title", "allDay"],
+                },
+              },
+              {
+                name: "syncAndDeleteEventsByTitle",
+                title: "Sync + Delete Events By Title",
+                description: "Start a non-blocking workflow: pre-sync, scan range, delete matching events, post-sync",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    tbsyncUser: { type: "string" },
+                    calendarName: { type: "string" },
+                    calendarId: { type: "string" },
+                    start: { type: "string", description: "YYYY-MM-DDTHH:MM" },
+                    end: { type: "string", description: "YYYY-MM-DDTHH:MM" },
+                    titleMustContainAll: { type: "array", items: { type: "string" }, description: "All substrings that must appear in title (case-insensitive)" }
+                  },
+                  required: ["tbsyncUser", "start", "end", "titleMustContainAll"],
                 },
               },
             ];
@@ -905,6 +1102,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await syncAndCreateCalendarEvent(args);
                 case "getWorkflowJob":
                   return getWorkflowJob(args.workflowJobId);
+                case "syncAndDeleteEventsByTitle":
+                  return await syncAndDeleteEventsByTitle(args);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
