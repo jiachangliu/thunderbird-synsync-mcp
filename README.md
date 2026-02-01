@@ -35,14 +35,22 @@ MCP Client <--stdio--> mcp-bridge.cjs <--HTTP--> Thunderbird Extension (localhos
 
 If TbSync (or the EAS provider) is not installed, tools will return a clear error.
 
-## Planned tools
+## Tools
 
-- `listCalendars` (read-only)
+Implemented tools are exposed via JSON-RPC on `http://localhost:8766`.
+
 - `tbsyncListAccounts`
-- `tbsyncSyncAccount` (by account ID)
-- `tbsyncSyncAccountByUser` (match `jl4624@cornell.edu`, etc.)
-- `createCalendarEvent` (all-day + timed events)
-- `syncAndCreateCalendarEvent` (pre-sync -> create -> post-sync; safest default)
+- `tbsyncSyncAccount` (by TbSync account ID)
+- `tbsyncSyncAccountByUser` (by user email, e.g. `jl4624@cornell.edu`)
+- `listCalendars`
+- `createCalendarEvent` (**v0.1.0: all-day only**)
+- `syncAndCreateCalendarEvent` (pre-sync → create → post-sync; safest default)
+
+## Documentation
+
+Start here:
+- `docs/USAGE.md` — quick-start + copy/paste curl examples
+- `docs/TROUBLESHOOTING.md` — common issues (port not listening, hangs, dependency checks)
 
 ## Development notes
 
@@ -53,4 +61,8 @@ This project is meant to be open-source friendly:
 
 ## License
 
-TBD (recommend MIT to match the style of `thunderbird-mcp`).
+MIT. See `LICENSE`.
+
+### Notices
+
+This project includes/depends on components under other licenses (e.g., Mozilla/Thunderbird components under MPL-2.0). See `NOTICE.md`.
