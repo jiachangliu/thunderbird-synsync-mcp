@@ -91,18 +91,21 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               return new Promise((resolve) => {
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 _activeTimers.add(timer);
-                timer.init(
-                  {
-                    notify: () => {
-                      try {
-                        _activeTimers.delete(timer);
-                      } catch {}
-                      resolve({ timeout: true });
-                    },
+                const cb = {
+                  notify: () => {
+                    try { _activeTimers.delete(timer); } catch {}
+                    resolve({ timeout: true });
                   },
-                  timeoutMs,
-                  Ci.nsITimer.TYPE_ONE_SHOT
-                );
+                };
+                try {
+                  // In privileged JS, initWithCallback is the reliable API. Using init() can result
+                  // in callbacks never firing (and workflow jobs hanging).
+                  timer.initWithCallback(cb, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                } catch (e) {
+                  try { _activeTimers.delete(timer); } catch {}
+                  // Fail open: don't hang callers.
+                  resolve({ timeout: true, error: String(e) });
+                }
               });
             }
 
