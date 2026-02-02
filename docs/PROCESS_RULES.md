@@ -36,6 +36,10 @@ This document is the **single source of truth** for how we operate the Thunderbi
 4) **Don’t restart Thunderbird for syncing**
    - Restart only when needed to activate a newly-installed add-on build.
 
+5) **Scheduled means “exists on Outlook calendar + has synced to cloud”**
+   - If a task is marked scheduled in any task system, there must be a **real calendar event** created and visible in Outlook cloud.
+   - When you notice “scheduled but not on calendar”, treat it as a **bug**: create the missing event immediately (or mark it unscheduled until fixed).
+
 ## Idempotency and Tagging
 
 - Every managed event should include a short tag at the **end of the title**, e.g.:
@@ -65,7 +69,7 @@ Symptom:
 
 Fix (programmatic):
 1) Run `tbsyncResetEasFolderSync` for the Cornell account (forces FolderSync refresh).
-2) Re-select the EAS folder `foldername="Calendar"` (usually `serverID="2"`) via `tbsyncSelectEasCalendarFolder`.
+2) Re-select the EAS folder `foldername="Calendar"` (often `serverID="2"`) via `tbsyncSelectEasCalendarFolder`.
 3) Confirm `listCalendars` includes `Jiachang Liu Cornell (Calendar)`.
 
 ## Operational Checklist (for risky sessions)
